@@ -9,6 +9,7 @@ import argparse
 import csv
 import math
 import time
+import numpy as np
 
 # a global object id counter for the different objects for TrakEM2
 global_oid_counter = 5
@@ -41,9 +42,9 @@ def read_dimensions(img_file):
         return read_bmp_dimensions(img_file)
     else:
         import cv2
-        im = cv2.imread(image_file, cv2.IMREAD_GRAYSCALE)
+        im = cv2.imread(img_file, cv2.IMREAD_GRAYSCALE)
         if im is None:
-            print('Cannot read tile image: {}'.format(image_file))
+            print('Cannot read tile image: {}'.format(img_file))
             sys.exit(1)
         return im.shape
 
@@ -421,7 +422,7 @@ def write_patch(out_data, tile):
                                 """ + 'oid="{}"'.format(fetch_and_increase_oid()) + """
                                 """ + 'width="{}.0"'.format(tile["width"]) + """
                                 """ + 'height="{}.0"'.format(tile["height"]) + """
-                                """ + 'transform="matrix(1.0,0.0,0.0,1.0,{},{})"'.format(float(tile["tx"]), float(tile["ty"])) + """
+                                """ + 'transform="matrix({},{},{},{},{},{})"'.format(float(tile["t1"]), float(tile["t2"]), float(tile["t3"]), float(tile["t4"]), float(tile["tx"]), float(tile["ty"])) + """
                                 """ + 'title="{}"'.format(tile["file_base_name"]) + """
                                 links=""
                                 type="0"
@@ -438,11 +439,13 @@ def write_patch(out_data, tile):
     out_data.writelines(patch_lines)
 
 
-def parse_layer(base_dir, images, x, y):
+def parse_layer(base_dir, images, x, y, T):
     '''Writes the tilespec for a single section'''
     tiles = []
     layer_size = [0, 0]
     image_size = None
+
+    #ICS2Stage = np.matrix([[T[0], T[1]],[T[2], T[3]]])
 
     for i, img in enumerate(images):
         # If not using windows, change the folder separator
@@ -457,11 +460,20 @@ def parse_layer(base_dir, images, x, y):
         tile["file_base_name"] = os.path.basename(tile["file_full_path"])
         tile["width"] = image_size[1]
         tile["height"] = image_size[0]
-        tile["tx"] = x[i]
-        tile["ty"] = y[i]
+        tile["t1"] = T[0,0]
+        tile["t2"] = T[0,1]
+        tile["t3"] = T[1,0]
+        tile["t4"] = T[1,1]
+        #tile["tx"] = x[i] + T[4]
+        #tile["ty"] = y[i] + T[5]
+        tile["tx"] = x[i] * T.I[0,0] + y[i] * T.I[0,1]
+        tile["ty"] = x[i] * T.I[1,0] + y[i] * T.I[1,1]
+        #tile["tx"] = x[i]
+        #tile["ty"] = y[i]
+
         tiles.append(tile)
-        layer_size[0] = max(layer_size[0], image_size[0] + tile["ty"])
-        layer_size[1] = max(layer_size[1], image_size[1] + tile["tx"])
+        #layer_size[0] = max(layer_size[0], image_size[0] + tile["ty"])
+        #layer_size[1] = max(layer_size[1], image_size[1] + tile["tx"])
 
     # if len(tiles) > 0:
     #     write_layer(out_data, layer, tiles)
@@ -485,7 +497,7 @@ def parse_coordinates_file(input_file):
         data_reader = csv.reader(csvfile, delimiter='\t')
         for row in data_reader:
             img_fname = row[0]
-            img_sec_mfov_beam = '_'.join(img_fname.split('\\')[-1].split('_')[:3])
+            img_sec_mfov_beam = '_'.join(img_fname.split('\\')[-1].split('_')[:4])
             # Make sure that no duplicates appear
             if img_sec_mfov_beam not in images_dict.keys():
                 images.append(img_fname)
@@ -507,6 +519,82 @@ def parse_coordinates_file(input_file):
 
     return images, x, y
 
+
+def parse_region_coords(input_file, protocol_file):
+    pixelsize_nm = 4
+    thumbsscale = 32
+
+    #with open(protocol_file, 'rb') as f:
+    #    reader = csv.reader(f)
+    #    for row in reader:
+    #        print row
+    fobj = open(protocol_file)
+    firstline = fobj.readline()
+    fl = firstline.split(':')
+    #print fl[7]
+    sl = fl[7]
+    tl = ''.join(sl)
+    fl = tl.split(' ')
+    del fl[0]
+    del fl[4]
+    ICS2Stage = np.matrix(fl[0] + ' ' + fl[2] + ';' + fl[1] + ' ' + fl[3])
+    #print ICS2Stage
+    #print(ICS2Stage.I)
+
+    region_coords_x = []
+    region_coords_y = []
+    with open(input_file, 'r') as csvfile:
+        data_reader = csv.reader(csvfile, delimiter=';')
+        for row in data_reader:
+            x_SCS = float(row[0]) / (thumbsscale * pixelsize_nm * 1e-3)
+            y_SCS = float(row[1]) / (thumbsscale * pixelsize_nm * 1e-3)
+            x_ICS = x_SCS * ICS2Stage.I[0,0] + y_SCS * ICS2Stage.I[1,0]
+            y_ICS = x_SCS * ICS2Stage.I[0,1] + y_SCS * ICS2Stage.I[1,1]
+            region_coords_x.append(x_ICS)
+            region_coords_y.append(y_ICS)
+        # remove last element
+        del region_coords_x[-1]
+        del region_coords_y[-1]
+        region_centre_x = sum(region_coords_x) / len(region_coords_x)
+        region_centre_y = sum(region_coords_y) / len(region_coords_y)
+    return region_coords_x, region_coords_y, region_centre_x, region_centre_y
+
+def calculate_affine_transform(x,y,x_REF,y_REF):
+    # calculate transformation
+    primary = np.array([[x[0], y[0], 0.],
+                        [x[1], y[1], 0.],
+                        [x[2], y[2], 0.],
+                        [x[3], y[3], 0.]])
+
+    secondary = np.array([[x_REF[0], y_REF[0], 0.],
+                        [x_REF[1], y_REF[1], 0.],
+                        [x_REF[2], y_REF[2], 0.],
+                        [x_REF[3], y_REF[3], 0.]])
+
+    # Pad the data with ones, so that our transformation can do translations too
+    n = primary.shape[0]
+    pad = lambda x: np.hstack([x, np.ones((x.shape[0], 1))])
+    unpad = lambda x: x[:,:-1]
+    X = pad(primary)
+    Y = pad(secondary)
+    # Solve the least squares problem X * A = Y
+    # to find our transformation matrix A
+    A, res, rank, s = np.linalg.lstsq(X, Y)
+    transform = lambda x: unpad(np.dot(pad(x), A))
+    t1 = A[0,0]
+    t2 = A[0,1]
+    t3 = A[1,0]
+    t4 = A[1,1]
+    t5 = A[3,0]
+    t6 = A[3,1]
+    #T = np.array([t1, t2, t3, t4, t5, t6])
+    T = np.matrix([[t1, t2],[t3, t4]])
+    #print ICS2Stage
+    #print ICS2Stage.I
+    #print(T)
+    return T
+
+
 def offset_list(lst):
     m = min(lst)
     return [item - m for item in lst]
@@ -515,16 +603,16 @@ def offset_list(lst):
 if __name__ == '__main__':
 
     # Command line parser
-    parser = argparse.ArgumentParser(description='Creates the TrakEM2 xml file for images that were acquired using the multiebeam EM.')
-    parser.add_argument('input_folder', metavar='input_folder', type=str, 
+    parser = argparse.ArgumentParser(description='Creates the TrakEM2 xml file for images that were acquired using the multibeam EM.')
+    parser.add_argument('input_folder', metavar='input_folder', type=str,
                     help='a directory that contains sections subdirectories in which a full_coordinates txt file per section')
-    parser.add_argument('-t', '--mipmap_threads', type=int, 
+    parser.add_argument('-t', '--mipmap_threads', type=int,
                     help='number of mipmap threads that should be used (default: 8)',
                     default=8)
-    parser.add_argument('-o', '--output_xml', type=str, 
+    parser.add_argument('-o', '--output_xml', type=str,
                     help='the xml file where all the tiles will be stored (default: ./output.xml)',
                     default='./output.xml')
-    # parser.add_argument('-v', '--overlap', type=float, 
+    # parser.add_argument('-v', '--overlap', type=float,
     #                 help='the overlap fraction between the tiles (default: 0.06)', # 0.06 from Alyssa's data
     #                 default=0.06)
 
@@ -540,26 +628,70 @@ if __name__ == '__main__':
     max_layer_height = 0
 
     all_layers = []
+    first_region = 0
+    region_coords_x_REF = []
+    region_coords_y_REF = []
 
-    for sub_folder in all_sub_folders:
+    #for sub_folder in all_sub_folders:
+    for idx, val in enumerate(all_sub_folders):
+    #for idx, val in enumerate(list(range(10))):
+        sub_folder = all_sub_folders[idx]
         if os.path.isdir(sub_folder):
             print("Parsing subfolder: {}".format(sub_folder))
-            coords_file = os.path.join(sub_folder, "full_image_coordinates.txt")
-            if os.path.exists(coords_file):
+            # coords_file = os.path.join(sub_folder, "full_image_coordinates.txt")
+            coords_file = os.path.join(sub_folder, "full_thumbnail_coordinates.txt")
+            region_coords_file = os.path.join(sub_folder, "region_stage_coords.csv")
+            protocol_file = os.path.join(sub_folder, "protocol.txt")
+            if os.path.exists(region_coords_file):
+                layer = int(sub_folder.split(os.path.sep)[-1].split('_')[1].split('S')[1].split('R')[0])   # Christof - xxx_region_name, 15/7/24
+                if first_region == 0:
+                    region_coords_x_REF, region_coords_y_REF, region_centre_x_REF, region_centre_y_REF  = parse_region_coords(region_coords_file, protocol_file)
+                    first_region = 1
+                region_coords_x, region_coords_y, region_centre_x, region_centre_y = parse_region_coords(region_coords_file, protocol_file)
+                T = calculate_affine_transform([x - region_centre_x for x in region_coords_x],[x - region_centre_y for x in region_coords_y] , [x - region_centre_x_REF for x in region_coords_x_REF], [x - region_centre_y_REF for x in region_coords_y_REF])
                 images, x, y = parse_coordinates_file(coords_file)
-                x = offset_list(x)
-                y = offset_list(y)
-                cur_layer = parse_layer(sub_folder, images, x, y)
+#                x_centered = [x - region_centre_x + region_centre_x_REF) for x in x]
+#                y_centered = [x - region_centre_y + region_centre_y_REF for x in y]
+                x_centered = [dummy + region_centre_x for dummy in x]
+                y_centered = [dummy + region_centre_y for dummy in y]
+                # x = offset_list(x)
+                # y = offset_list(y)
+                cur_layer = parse_layer(sub_folder, images, x_centered, y_centered, T)
                 max_layer_width = max(max_layer_width, cur_layer["width"])
                 max_layer_height = max(max_layer_height, cur_layer["height"])
-                layer = int(sub_folder.split(os.path.sep)[-1])
                 cur_layer["layer_num"] = layer
                 all_layers.append(cur_layer)
             else:
-                print("Could not find full_image_coordinates.txt, skipping subfolder")
+                print("Could not find region_stage_coords.csv, skipping subfolder")
 
     max_layer_width = int(math.ceil(max_layer_width))
     max_layer_height = int(math.ceil(max_layer_height))
+    # calculate layer_size
+    dummy_tx = []
+    dummy_ty = []
+    for cur_layer in all_layers:
+        for tile in cur_layer["tiles"]:
+            dummy_tx.append(tile["tx"])
+            dummy_ty.append(tile["ty"])
+
+    max_layer_width = int(math.ceil(max(dummy_tx)-min(dummy_tx)))
+    max_layer_height = int(math.ceil(max(dummy_ty)-min(dummy_ty)))
+
+    # shift to non-zero values
+    if min(dummy_tx) > 0:
+        offset_x = min(dummy_tx)
+    else:
+        offset_x = -min(dummy_tx)
+    if min(dummy_ty) > 0:
+        offset_y = min(dummy_ty)
+    else:
+        offset_y = -min(dummy_ty)
+
+
+    for cur_layer in all_layers:
+        for tile in cur_layer["tiles"]:
+            tile["tx"] = tile["tx"] + offset_x
+            tile["ty"] = tile["ty"] + offset_y
 
     print("Done parsing, writing xml file")
 
